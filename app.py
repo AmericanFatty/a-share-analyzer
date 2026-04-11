@@ -41,6 +41,30 @@ WIN_COLUMNS = [
     "120日是否跑赢大盘",
     "截至最新是否跑赢大盘",
 ]
+FINAL_EXPORT_COLUMNS = [
+    "板块",
+    "股票名称",
+    "股票代码",
+    "看好日期",
+    "5日收益(%)",
+    "上证5日收益(%)",
+    "5日是否跑赢大盘",
+    "30日收益(%)",
+    "上证30日收益(%)",
+    "30日是否跑赢大盘",
+    "截至最新收益(%)",
+    "上证截至最新收益(%)",
+    "截至最新是否跑赢大盘",
+    "备注",
+]
+FINAL_PERCENT_COLUMNS = [
+    "5日收益(%)",
+    "上证5日收益(%)",
+    "30日收益(%)",
+    "上证30日收益(%)",
+    "截至最新收益(%)",
+    "上证截至最新收益(%)",
+]
 STOCK_MASTER_CACHE_PATH = Path(__file__).resolve().parent / ".stock_master_cache.csv"
 
 
@@ -474,6 +498,69 @@ def calc_return_on_dates(
     return ret, pd.to_datetime(buy_row["日期"]), pd.to_datetime(sell_row["日期"])
 
 
+def calc_return_by_trading_horizon(
+    history: pd.DataFrame,
+    input_buy_date: pd.Timestamp,
+    horizon: int,
+) -> Tuple[float, Optional[pd.Timestamp], Optional[pd.Timestamp]]:
+    if history is None or history.empty:
+        return np.nan, None, None
+    input_buy_ts = pd.to_datetime(input_buy_date, errors="coerce")
+    if pd.isna(input_buy_ts):
+        return np.nan, None, None
+    future = history[history["日期"] >= input_buy_ts]
+    if future.empty:
+        return np.nan, None, None
+    buy_idx = int(future.index[0])
+    buy_row = history.loc[buy_idx]
+    target_idx = buy_idx + horizon
+    if target_idx >= len(history):
+        return np.nan, pd.to_datetime(buy_row["日期"]), None
+    target_row = history.loc[target_idx]
+    buy_price = float(buy_row["收盘"])
+    target_price = float(target_row["收盘"])
+    ret = (target_price / buy_price - 1.0) * 100.0
+    return ret, pd.to_datetime(buy_row["日期"]), pd.to_datetime(target_row["日期"])
+
+
+def append_30day_comparison(
+    result: Dict[str, object],
+    stock_history: pd.DataFrame,
+    benchmark_history: pd.DataFrame,
+) -> Dict[str, object]:
+    out = dict(result)
+    stock_30_ret, stock_buy_actual, stock_30_date = calc_return_by_trading_horizon(
+        history=stock_history,
+        input_buy_date=pd.to_datetime(out.get("买入日期(输入)")),
+        horizon=30,
+    )
+    out["30日收益(%)"] = round(float(stock_30_ret), 3) if pd.notna(stock_30_ret) else np.nan
+    out["30日日期"] = stock_30_date.date() if stock_30_date is not None else pd.NaT
+
+    if (
+        benchmark_history is None
+        or benchmark_history.empty
+        or pd.isna(stock_30_ret)
+        or stock_30_date is None
+    ):
+        out["上证30日收益(%)"] = np.nan
+        out["30日是否跑赢大盘"] = "数据不足"
+        return out
+
+    bench_buy = stock_buy_actual or pd.to_datetime(out.get("实际买入日"))
+    bench_30_ret, _, _ = calc_return_on_dates(
+        history=benchmark_history,
+        buy_date=bench_buy,
+        target_date=stock_30_date,
+    )
+    out["上证30日收益(%)"] = round(float(bench_30_ret), 3) if pd.notna(bench_30_ret) else np.nan
+    if pd.notna(bench_30_ret):
+        out["30日是否跑赢大盘"] = "是" if float(stock_30_ret) - float(bench_30_ret) > 0 else "否"
+    else:
+        out["30日是否跑赢大盘"] = "数据不足"
+    return out
+
+
 def calc_max_drawdown_pct(price_series: pd.Series) -> float:
     if price_series is None or price_series.empty:
         return np.nan
@@ -689,11 +776,12 @@ def make_price_figure(
     return fig
 
 
-def read_uploaded_file(uploaded_file) -> pd.DataFrame:
+def read_uploaded_file(uploaded_file) -> Dict[str, pd.DataFrame]:
     name = uploaded_file.name.lower()
     if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file)
-    return pd.read_excel(uploaded_file)
+        return {"Sheet1": pd.read_csv(uploaded_file)}
+    excel_map = pd.read_excel(uploaded_file, sheet_name=None)
+    return {str(k): v for k, v in excel_map.items()}
 
 
 def match_column(columns: List[str], candidates: List[str]) -> Optional[str]:
@@ -721,8 +809,17 @@ def build_template_excel() -> bytes:
 
 
 def summarize_batch(result_df: pd.DataFrame) -> pd.DataFrame:
+    candidate_cols = [
+        "5日收益(%)",
+        "20日收益(%)",
+        "30日收益(%)",
+        "120日收益(%)",
+        "截至最新收益(%)",
+    ]
     rows = []
-    for col in RETURN_COLUMNS:
+    for col in candidate_cols:
+        if col not in result_df.columns:
+            continue
         s = pd.to_numeric(result_df[col], errors="coerce").dropna()
         if s.empty:
             continue
@@ -780,34 +877,59 @@ def percent_to_text(value: object, ndigits: int = 2) -> str:
 
 
 def build_export_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
-    export_df = result_df.copy()
-    percent_cols = [
-        col
-        for col in export_df.columns
-        if "(%)" in col or "胜率(%)" in col or "跑赢率(%)" in col
-    ]
-    for col in percent_cols:
+    temp = result_df.copy()
+    if "买入日期(输入)" in temp.columns:
+        temp["看好日期"] = temp["买入日期(输入)"]
+    elif "看好日期" not in temp.columns:
+        temp["看好日期"] = pd.NaT
+
+    export_df = pd.DataFrame()
+    for col in FINAL_EXPORT_COLUMNS:
+        export_df[col] = temp[col] if col in temp.columns else ""
+
+    for col in FINAL_PERCENT_COLUMNS:
         export_df[col] = export_df[col].apply(percent_to_text)
 
-    for col in export_df.columns:
-        if "日期" in col:
-            export_df[col] = export_df[col].astype(str).replace({"NaT": "", "nan": ""})
-
-    cols = list(export_df.columns)
-    first_cols: List[str] = []
-    last_cols: List[str] = []
-    if "板块" in cols:
-        first_cols.append("板块")
-    if "备注" in cols:
-        last_cols.append("备注")
-    middle_cols = [c for c in cols if c not in set(first_cols + last_cols)]
-    ordered_cols = first_cols + middle_cols + last_cols
-    return export_df[ordered_cols]
+    if "看好日期" in export_df.columns:
+        export_df["看好日期"] = pd.to_datetime(
+            export_df["看好日期"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d").replace({pd.NA: "", "NaT": "", "nan": ""})
+    for col in ["板块", "备注", "股票名称", "股票代码"]:
+        if col in export_df.columns:
+            export_df[col] = export_df[col].astype(str).replace({"nan": "", "None": ""})
+    return export_df
 
 
 def dataframe_to_excel_bytes(df: pd.DataFrame) -> bytes:
     buffer = BytesIO()
     df.to_excel(buffer, index=False)
+    buffer.seek(0)
+    return buffer.read()
+
+
+def safe_sheet_name(name: str) -> str:
+    invalid = set('[]:*?/\\')
+    cleaned = "".join(ch for ch in str(name) if ch not in invalid).strip()
+    if not cleaned:
+        cleaned = "Sheet"
+    return cleaned[:31]
+
+
+def dataframes_to_excel_bytes(sheet_df_map: Dict[str, pd.DataFrame]) -> bytes:
+    buffer = BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        used_names: Dict[str, int] = {}
+        for idx, (sheet, df) in enumerate(sheet_df_map.items()):
+            base = safe_sheet_name(sheet)
+            if base in used_names:
+                used_names[base] += 1
+                suffix = f"_{used_names[base]}"
+                sheet_name = (base[: 31 - len(suffix)] + suffix)[:31]
+            else:
+                used_names[base] = 0
+                sheet_name = base
+            out_df = df if df is not None else pd.DataFrame()
+            out_df.to_excel(writer, index=False, sheet_name=sheet_name)
     buffer.seek(0)
     return buffer.read()
 
@@ -950,6 +1072,11 @@ def run_batch_analysis(
             stock_history=hist,
             benchmark_history=benchmark_history,
             result=analyzed,
+        )
+        analyzed = append_30day_comparison(
+            result=analyzed,
+            stock_history=hist,
+            benchmark_history=benchmark_history,
         )
         analyzed["行情来源"] = fetch_bundle.get("source", "")
         analyzed["大盘行情来源"] = benchmark_bundle.get("source", "")
@@ -1192,7 +1319,7 @@ def render_single_stock_panel(mobile_mode: bool = False) -> None:
 def render_batch_panel(mobile_mode: bool = False) -> None:
     st.markdown("### Excel批量统计")
     st.markdown(
-        '<div class="caption-box">导入你关心的股票列表后，自动计算 5日/20日/120日/截至最新收益，并与上证指数比较超额收益和跑赢率。</div>',
+        '<div class="caption-box">导入你关心的股票列表后，自动计算并导出 5日/30日/截至最新收益，与上证指数比较是否跑赢大盘。</div>',
         unsafe_allow_html=True,
     )
 
@@ -1213,17 +1340,29 @@ def render_batch_panel(mobile_mode: bool = False) -> None:
         return
 
     try:
-        df_input = read_uploaded_file(uploaded)
+        sheet_map = read_uploaded_file(uploaded)
     except Exception as exc:
         st.error(f"读取文件失败：{exc}")
         return
 
-    if df_input.empty:
+    if not sheet_map:
         st.warning("文件为空，请检查后重新上传。")
         return
 
-    st.write("文件预览（前10行）")
-    st.dataframe(df_input.head(10), use_container_width=True)
+    preview_rows: List[pd.DataFrame] = []
+    for sheet_name, df_sheet in sheet_map.items():
+        if df_sheet is None or df_sheet.empty:
+            continue
+        head = df_sheet.head(5).copy()
+        head.insert(0, "工作表", sheet_name)
+        preview_rows.append(head)
+    if not preview_rows:
+        st.warning("所有工作表都为空，请检查后重新上传。")
+        return
+
+    preview_df = pd.concat(preview_rows, ignore_index=True)
+    st.write("文件预览（每个Sheet前5行）")
+    st.dataframe(preview_df, use_container_width=True)
 
     if not st.button("开始批量计算", use_container_width=True):
         return
@@ -1236,38 +1375,64 @@ def render_batch_panel(mobile_mode: bool = False) -> None:
         st.caption(f"基础信息错误：{exc}")
 
     with st.spinner("批量计算中，请稍候..."):
+        all_result_frames: List[pd.DataFrame] = []
+        all_failed_frames: List[pd.DataFrame] = []
+        export_sheet_map: Dict[str, pd.DataFrame] = {}
         try:
-            result_df, failed_df = run_batch_analysis(df_input, stock_master)
+            for sheet_idx, (sheet_name, df_sheet) in enumerate(sheet_map.items()):
+                if df_sheet is None or df_sheet.empty:
+                    export_sheet_map[sheet_name] = pd.DataFrame(columns=FINAL_EXPORT_COLUMNS)
+                    continue
+                result_df_sheet, failed_df_sheet = run_batch_analysis(df_sheet, stock_master)
+                if not result_df_sheet.empty:
+                    result_df_sheet["__sheet_order"] = sheet_idx
+                    result_df_sheet["工作表"] = sheet_name
+                    all_result_frames.append(result_df_sheet)
+                    ordered_sheet = result_df_sheet.sort_values("来源行号").reset_index(drop=True)
+                    export_sheet_map[sheet_name] = build_export_dataframe(ordered_sheet)
+                else:
+                    export_sheet_map[sheet_name] = pd.DataFrame(columns=FINAL_EXPORT_COLUMNS)
+                if not failed_df_sheet.empty:
+                    failed_copy = failed_df_sheet.copy()
+                    failed_copy.insert(0, "工作表", sheet_name)
+                    all_failed_frames.append(failed_copy)
         except Exception as exc:
             st.error(f"批量分析失败：{exc}")
             return
 
-    if result_df.empty:
+    if not all_result_frames:
         st.error("没有成功计算的记录。")
-        if not failed_df.empty:
-            st.dataframe(failed_df, use_container_width=True)
+        if all_failed_frames:
+            failed_df_all = pd.concat(all_failed_frames, ignore_index=True)
+            st.dataframe(failed_df_all, use_container_width=True)
         return
 
-    st.success(f"批量分析完成：成功 {len(result_df)} 条。")
+    result_df = pd.concat(all_result_frames, ignore_index=True)
+    if all_failed_frames:
+        failed_df = pd.concat(all_failed_frames, ignore_index=True)
+    else:
+        failed_df = pd.DataFrame()
 
-    latest_series = pd.to_numeric(result_df["截至最新收益(%)"], errors="coerce").dropna()
+    ordered_result_df = result_df.sort_values(["__sheet_order", "来源行号"]).reset_index(drop=True)
+    st.success(f"批量分析完成：成功 {len(ordered_result_df)} 条。")
+
+    latest_series = pd.to_numeric(ordered_result_df["截至最新收益(%)"], errors="coerce").dropna()
     win_rate_latest = float((latest_series > 0).mean() * 100) if not latest_series.empty else np.nan
     mean_latest = float(latest_series.mean()) if not latest_series.empty else np.nan
-    if "截至最新超额收益(%)" in result_df.columns:
+    if "截至最新超额收益(%)" in ordered_result_df.columns:
         latest_excess_series = pd.to_numeric(
-            result_df["截至最新超额收益(%)"], errors="coerce"
+            ordered_result_df["截至最新超额收益(%)"], errors="coerce"
         ).dropna()
     else:
         latest_excess_series = pd.Series(dtype=float)
-    mean_latest_excess = float(latest_excess_series.mean()) if not latest_excess_series.empty else np.nan
-    beat_col = result_df.get("截至最新是否跑赢大盘")
+    beat_col = ordered_result_df.get("截至最新是否跑赢大盘")
     beat_rate_latest = np.nan
     if beat_col is not None:
         valid = beat_col.isin(["是", "否"])
         if valid.any():
             beat_rate_latest = float((beat_col[valid] == "是").mean() * 100)
-    best_row = result_df.loc[result_df["截至最新收益(%)"].idxmax()]
-    worst_row = result_df.loc[result_df["截至最新收益(%)"].idxmin()]
+    best_row = ordered_result_df.loc[ordered_result_df["截至最新收益(%)"].idxmax()]
+    worst_row = ordered_result_df.loc[ordered_result_df["截至最新收益(%)"].idxmin()]
 
     if mobile_mode:
         k1, k2 = st.columns(2)
@@ -1289,8 +1454,10 @@ def render_batch_panel(mobile_mode: bool = False) -> None:
         else:
             k4.metric("截至最新跑赢率", "数据不足")
 
-    summary_df = summarize_batch(result_df)
-    summary_excess_df = summarize_excess_batch(result_df)
+    summary_df = summarize_batch(ordered_result_df)
+    summary_excess_df = summarize_excess_batch(ordered_result_df)
+    summary_df = summary_df[summary_df["周期"].isin(["5日", "30日", "截至最新"])]
+    summary_excess_df = summary_excess_df[summary_excess_df["周期"].isin(["5日", "30日", "截至最新"])]
     if mobile_mode:
         if summary_df.empty:
             st.info("汇总样本不足。")
@@ -1331,14 +1498,14 @@ def render_batch_panel(mobile_mode: bool = False) -> None:
             st.plotly_chart(fig_excess_avg, use_container_width=True)
 
         hist = px.histogram(
-            result_df,
-            x="截至最新超额收益(%)" if "截至最新超额收益(%)" in result_df.columns else "截至最新收益(%)",
+            ordered_result_df,
+            x="截至最新超额收益(%)" if "截至最新超额收益(%)" in ordered_result_df.columns else "截至最新收益(%)",
             nbins=22,
             color_discrete_sequence=["#2f80ed"],
             title="截至最新超额收益分布",
         )
         hist.add_vline(
-            x=float(latest_excess_series.mean()) if not latest_excess_series.empty else float(result_df["截至最新收益(%)"].mean()),
+            x=float(latest_excess_series.mean()) if not latest_excess_series.empty else float(ordered_result_df["截至最新收益(%)"].mean()),
             line_dash="dash",
             line_color="#eb5757",
             annotation_text="平均值",
@@ -1392,14 +1559,14 @@ def render_batch_panel(mobile_mode: bool = False) -> None:
                 st.plotly_chart(fig_excess_avg, use_container_width=True)
 
         hist = px.histogram(
-            result_df,
-            x="截至最新超额收益(%)" if "截至最新超额收益(%)" in result_df.columns else "截至最新收益(%)",
+            ordered_result_df,
+            x="截至最新超额收益(%)" if "截至最新超额收益(%)" in ordered_result_df.columns else "截至最新收益(%)",
             nbins=22,
             color_discrete_sequence=["#2f80ed"],
             title="截至最新超额收益分布",
         )
         hist.add_vline(
-            x=float(latest_excess_series.mean()) if not latest_excess_series.empty else float(result_df["截至最新收益(%)"].mean()),
+            x=float(latest_excess_series.mean()) if not latest_excess_series.empty else float(ordered_result_df["截至最新收益(%)"].mean()),
             line_dash="dash",
             line_color="#eb5757",
             annotation_text="平均值",
@@ -1414,84 +1581,15 @@ def render_batch_panel(mobile_mode: bool = False) -> None:
             unsafe_allow_html=True,
         )
 
-    rank_base = result_df[["股票名称", "股票代码", "截至最新收益(%)"]].copy()
-    rank_base["标签"] = rank_base["股票名称"] + "(" + rank_base["股票代码"] + ")"
-    st.caption("Top 10 / Bottom 10 基于绝对收益排序（非超额收益）。")
+    st.write("批量明细（保持原始输入顺序）")
+    display_df = build_export_dataframe(ordered_result_df)
+    st.dataframe(display_df, use_container_width=True, hide_index=True)
 
-    if mobile_mode:
-        st.write("Top / Bottom 排名")
-        rank_tab1, rank_tab2 = st.tabs(["Top 10", "Bottom 10"])
-        with rank_tab1:
-            top10 = rank_base.sort_values("截至最新收益(%)", ascending=False).head(10)
-            fig_top = px.bar(
-                top10.iloc[::-1],
-                x="截至最新收益(%)",
-                y="标签",
-                orientation="h",
-                title="Top 10",
-                color="截至最新收益(%)",
-                color_continuous_scale="Greens",
-            )
-            fig_top.update_layout(coloraxis_showscale=False, height=360, margin=dict(l=10, r=10, t=45, b=15))
-            st.plotly_chart(fig_top, use_container_width=True)
-        with rank_tab2:
-            bottom10 = rank_base.sort_values("截至最新收益(%)", ascending=True).head(10)
-            fig_bottom = px.bar(
-                bottom10,
-                x="截至最新收益(%)",
-                y="标签",
-                orientation="h",
-                title="Bottom 10",
-                color="截至最新收益(%)",
-                color_continuous_scale="Reds",
-            )
-            fig_bottom.update_layout(coloraxis_showscale=False, height=360, margin=dict(l=10, r=10, t=45, b=15))
-            st.plotly_chart(fig_bottom, use_container_width=True)
+    if len(export_sheet_map) == 1:
+        single_sheet_df = next(iter(export_sheet_map.values()))
+        excel_bytes = dataframe_to_excel_bytes(single_sheet_df)
     else:
-        rank_cols = st.columns(2)
-        with rank_cols[0]:
-            top10 = rank_base.sort_values("截至最新收益(%)", ascending=False).head(10)
-            fig_top = px.bar(
-                top10.iloc[::-1],
-                x="截至最新收益(%)",
-                y="标签",
-                orientation="h",
-                title="Top 10",
-                color="截至最新收益(%)",
-                color_continuous_scale="Greens",
-            )
-            fig_top.update_layout(coloraxis_showscale=False, height=420)
-            st.plotly_chart(fig_top, use_container_width=True)
-
-        with rank_cols[1]:
-            bottom10 = rank_base.sort_values("截至最新收益(%)", ascending=True).head(10)
-            fig_bottom = px.bar(
-                bottom10,
-                x="截至最新收益(%)",
-                y="标签",
-                orientation="h",
-                title="Bottom 10",
-                color="截至最新收益(%)",
-                color_continuous_scale="Reds",
-            )
-            fig_bottom.update_layout(coloraxis_showscale=False, height=420)
-            st.plotly_chart(fig_bottom, use_container_width=True)
-
-    st.write("批量明细")
-    sort_df = result_df.sort_values("截至最新收益(%)", ascending=False).reset_index(drop=True)
-    show_cols = list(sort_df.columns)
-    show_first: List[str] = []
-    show_last: List[str] = []
-    if "板块" in show_cols:
-        show_first.append("板块")
-    if "备注" in show_cols:
-        show_last.append("备注")
-    show_middle = [c for c in show_cols if c not in set(show_first + show_last)]
-    display_df = sort_df[show_first + show_middle + show_last]
-    st.dataframe(display_df, use_container_width=True)
-
-    export_df = build_export_dataframe(sort_df)
-    excel_bytes = dataframe_to_excel_bytes(export_df)
+        excel_bytes = dataframes_to_excel_bytes(export_sheet_map)
     st.download_button(
         "下载结果Excel",
         data=excel_bytes,
