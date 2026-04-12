@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from io import BytesIO
 from pathlib import Path
+import re
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -784,13 +785,76 @@ def read_uploaded_file(uploaded_file) -> Dict[str, pd.DataFrame]:
     return {str(k): v for k, v in excel_map.items()}
 
 
-def match_column(columns: List[str], candidates: List[str]) -> Optional[str]:
-    normalized = {col: str(col).strip().lower().replace(" ", "") for col in columns}
-    normalized_candidates = {c.strip().lower().replace(" ", "") for c in candidates}
-    for col, norm in normalized.items():
-        if norm in normalized_candidates:
-            return col
+def normalize_header_text(value: object) -> str:
+    if value is None:
+        return ""
+    text = str(value).replace("\ufeff", "").strip().lower()
+    text = re.sub(r"[\s\u3000\xa0]+", "", text)
+    text = re.sub(r"[()（）【】\[\]<>《》:_\-]+", "", text)
+    return text
+
+
+def match_column(columns: List[object], candidates: List[str]) -> Optional[object]:
+    normalized = {col: normalize_header_text(col) for col in columns}
+    normalized_candidates = [normalize_header_text(c) for c in candidates]
+    normalized_candidates = [c for c in normalized_candidates if c]
+
+    # First pass: exact normalized match.
+    for candidate in normalized_candidates:
+        for col, norm in normalized.items():
+            if norm == candidate:
+                return col
+
+    # Second pass: containment match for robust header variants (e.g. "备注信息").
+    generic_terms = {"股票", "名称", "代码", "日期", "name", "code", "date"}
+    for candidate in normalized_candidates:
+        if candidate in generic_terms:
+            continue
+        for col, norm in normalized.items():
+            if candidate and candidate in norm:
+                return col
     return None
+
+
+def clean_text_cell(value: object) -> object:
+    if pd.isna(value):
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    return value
+
+
+def clean_code_cell(value: object) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip()
+    if re.fullmatch(r"\d{1,6}", text):
+        return text.zfill(6)
+    return text
+
+
+def is_unnamed_column_name(column_name: object) -> bool:
+    if column_name is None:
+        return False
+    return normalize_header_text(column_name).startswith("unnamed")
+
+
+def list_unmatched_non_empty_columns(
+    df_input: pd.DataFrame,
+    matched_columns: List[Optional[object]],
+) -> List[object]:
+    matched_set = {col for col in matched_columns if col is not None}
+    unmatched_columns: List[object] = []
+    for col in df_input.columns:
+        if col in matched_set:
+            continue
+        if is_unnamed_column_name(col):
+            continue
+        series = df_input[col] if col in df_input.columns else pd.Series(dtype=object)
+        if series.dropna().empty:
+            continue
+        unmatched_columns.append(col)
+    return unmatched_columns
 
 
 def build_template_excel() -> bytes:
@@ -894,9 +958,11 @@ def build_export_dataframe(result_df: pd.DataFrame) -> pd.DataFrame:
         export_df["看好日期"] = pd.to_datetime(
             export_df["看好日期"], errors="coerce"
         ).dt.strftime("%Y-%m-%d").replace({pd.NA: "", "NaT": "", "nan": ""})
-    for col in ["板块", "备注", "股票名称", "股票代码"]:
+    for col in ["板块", "备注", "股票名称"]:
         if col in export_df.columns:
-            export_df[col] = export_df[col].astype(str).replace({"nan": "", "None": ""})
+            export_df[col] = export_df[col].apply(clean_text_cell)
+    if "股票代码" in export_df.columns:
+        export_df["股票代码"] = export_df["股票代码"].apply(clean_code_cell)
     return export_df
 
 
@@ -943,7 +1009,19 @@ def run_batch_analysis(
     code_col = match_column(columns, ["股票代码", "代码", "stock_code", "code", "ticker"])
     buy_col = match_column(columns, ["买入日期", "买入日", "日期", "buy_date", "date"])
     sector_col = match_column(columns, ["板块", "行业", "sector", "industry"])
-    note_col = match_column(columns, ["备注", "remark", "note"])
+    note_col = match_column(
+        columns,
+        ["备注", "备注信息", "备注说明", "附注", "remark", "remarks", "note", "memo"],
+    )
+    unmatched_cols = list_unmatched_non_empty_columns(
+        df_input,
+        [name_col, code_col, buy_col, sector_col, note_col],
+    )
+    if sector_col is None and len(unmatched_cols) >= 2:
+        sector_col = unmatched_cols[0]
+        unmatched_cols = [col for col in unmatched_cols if col != sector_col]
+    if note_col is None and unmatched_cols:
+        note_col = unmatched_cols[-1]
 
     if buy_col is None or (name_col is None and code_col is None):
         raise ValueError(
